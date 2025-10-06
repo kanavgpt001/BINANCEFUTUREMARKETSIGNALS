@@ -1,0 +1,966 @@
+# ==============================================================================
+# Enhanced Scalping Bot with High-Accuracy Indicators
+# ==============================================================================
+import pandas as pd
+from binance.client import Client
+from binance import BinanceSocketManager
+import ta
+import numpy as np
+import time
+import os
+import warnings
+import logging
+from threading import Thread, Lock
+from datetime import datetime, timedelta
+from ta.utils import dropna
+from scipy.signal import argrelextrema
+import tkinter as tk
+from tkinter import scrolledtext
+import sys
+import io
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Suppress SSL warnings and pandas warnings
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+pd.set_option('mode.chained_assignment', None)
+
+# --- Configuration ---
+API_KEY = "nAOUyjS7pRj9YVpkU8o3SkshIAe5yjAjVZznLyc04gKxFaRhefGFIye8ONNkINST"
+API_SECRET = "HhgMdAsBylrDMkYMU7scJAK2oGCdsPeWzdvSslEhCk8Xntns2ssFxjP78CO5bh6G"
+
+# Analysis Parameters
+TIME_FRAMES = ['1m', '3m', '5m']
+HISTORY_KLINE_LIMIT = 100
+SCAN_LIMIT = 700  # Focus on fewer pairs for better performance
+
+# Indicator Parameters
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+EMA_FAST_PERIOD = 5
+EMA_SLOW_PERIOD = 13
+EMA_TREND_PERIOD = 21
+MACD_FAST = 5
+MACD_SLOW = 13
+MACD_SIGNAL = 3
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD = 2
+ATR_PERIOD = 14
+VWAP_PERIOD = 20
+WILLIAMS_PERIOD = 14
+CCI_PERIOD = 20
+CCI_OVERBOUGHT = 100
+CCI_OVERSOLD = -100
+ADX_PERIOD = 14
+ADX_STRONG_TREND = 20
+OBV_SMOOTHING = 13
+
+# New Scalping Indicators
+VWMA_PERIOD = 10
+HULL_MA_PERIOD = 6
+KELTNER_PERIOD = 14
+KELTNER_MULTIPLIER = 1.5
+SUPERTREND_PERIOD = 5
+SUPERTREND_MULTIPLIER = 2.5
+ICHIMOKU_CONVERSION = 9
+ICHIMOKU_BASE = 26
+ICHIMOKU_SPAN_B = 52
+
+# Advanced Scalping Indicators
+T3_PERIOD = 5
+T3_VOLUME_FACTOR = 0.7
+EFI_PERIOD = 13
+ZLEMA_PERIOD = 10
+TEMA_PERIOD = 5
+JS_PERIOD = 5
+JS_SMOOTHING = 3
+
+# Scalping Parameters
+MIN_CONFIDENCE = 40  # Higher confidence for scalping
+MAX_SPREAD_PCT = 0.1
+MIN_RISK_REWARD = 1.0  # Higher risk/reward for scalping
+STOP_LOSS_ATR_MULTIPLIER = 1.0  # Tighter stop loss for scalping
+TAKE_PROFIT_ATR_MULTIPLIER = 2.0  # Quick take profit
+MAX_POSITION_SIZE = 0.05  # Smaller position size for scalping
+
+# Support/Resistance Parameters
+SR_LOOKBACK = 8  # Shorter lookback for scalping
+SR_MIN_DISTANCE = 3  # Closer levels for scalping
+
+# Global variable to store last signals
+last_signals = []
+gui_instance = None
+print_lock = Lock()
+best_pairs = []
+sure_shot_signals = []
+
+# --- Initialize Binance REST Client ---
+try:
+    client = Client(API_KEY, API_SECRET, {"verify": False, "timeout": 30})
+    client.ping()
+    logger.info("Successfully connected to Binance REST API.")
+except Exception as e:
+    logger.error(f"Error connecting to Binance REST API: {e}")
+    exit()
+
+# GUI Setup
+class TradingBotGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("High-Accuracy Crypto Scalping Bot")
+        self.root.configure(bg='black')
+        self.root.geometry("1200x800")
+        
+        # Create text area with scrollbar
+        self.text_area = scrolledtext.ScrolledText(
+            root, 
+            wrap=tk.WORD, 
+            width=140, 
+            height=40,
+            bg='black',
+            fg='white',
+            font=('Courier New', 10)
+        )
+        self.text_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.text_area.configure(state="disabled")
+        
+        # Create a lock for thread-safe GUI updates
+        self.gui_lock = Lock()
+        
+    def update_display(self, text):
+        with self.gui_lock:
+            self.text_area.configure(state="normal")
+            self.text_area.insert(tk.END, text + "\n")
+            self.text_area.see(tk.END)
+            self.text_area.configure(state="disabled")
+            self.text_area.update()
+
+class ThreadSafePrint:
+    def __init__(self, gui):
+        self.gui = gui
+        
+    def write(self, text):
+        with print_lock:
+            if self.gui:
+                self.gui.update_display(text.strip())
+            else:
+                sys.__stdout__.write(text)
+                
+    def flush(self):
+        pass
+
+def get_latest_historical_data(symbol, interval):
+    """Fetches the latest historical data for analysis."""
+    try:
+        klines = client.futures_klines(
+            symbol=symbol,
+            interval=interval,
+            limit=HISTORY_KLINE_LIMIT
+        )
+        df = pd.DataFrame(klines, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time',
+            'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume',
+            'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = dropna(df)
+        logger.info(f"Fetched {len(df)} latest candles for {symbol} on {interval}")
+        return df
+    except Exception as e:
+        logger.error(f"Error fetching data for {symbol} on {interval}: {e}")
+        return pd.DataFrame()
+
+def calculate_pivot_points(df, period='daily'):
+    """
+    Calculate pivot points, support and resistance levels
+    period: 'daily' or 'weekly'
+    """
+    try:
+        if len(df) < 2:
+            return {}
+            
+        if period == 'daily':
+            # Use the last complete day's data for daily pivot points
+            pivot_df = df.resample('D').agg({
+                'high': 'max',
+                'low': 'min',
+                'close': 'last'
+            }).dropna()
+            
+            if len(pivot_df) < 2:
+                return {}
+                
+            yesterday = pivot_df.iloc[-2]
+        else:  # weekly
+            pivot_df = df.resample('W').agg({
+                'high': 'max',
+                'low': 'min',
+                'close': 'last'
+            }).dropna()
+            
+            if len(pivot_df) < 2:
+                return {}
+                
+            yesterday = pivot_df.iloc[-2]
+        
+        h, l, c = yesterday['high'], yesterday['low'], yesterday['close']
+        
+        # Calculate pivot points
+        pp = (h + l + c) / 3
+        r1 = (2 * pp) - l
+        s1 = (2 * pp) - h
+        r2 = pp + (h - l)
+        s2 = pp - (h - l)
+        r3 = h + 2 * (pp - l)
+        s3 = l - 2 * (h - pp)
+        
+        return {
+            'pivot_point': pp,
+            'support_1': s1,
+            'support_2': s2,
+            'support_3': s3,
+            'resistance_1': r1,
+            'resistance_2': r2,
+            'resistance_3': r3
+        }
+    except Exception as e:
+        logger.error(f"Error calculating pivot points: {e}")
+        return {}
+
+def calculate_support_resistance(df, num_levels=5):
+    """Calculates support and resistance levels using swing high/low detection."""
+    try:
+        # Find swing highs and lows
+        highs = df['high'].values
+        lows = df['low'].values
+        
+        # Find local maxima (resistance)
+        resistance_indices = argrelextrema(highs, np.greater, order=SR_LOOKBACK)[0]
+        resistance_levels = highs[resistance_indices]
+        
+        # Find local minima (support)
+        support_indices = argrelextrema(lows, np.less, order=SR_LOOKBACK)[0]
+        support_levels = lows[support_indices]
+        
+        # Filter and sort levels
+        current_price = df['close'].iloc[-1]
+        
+        # Get resistance levels above current price
+        resistance_above = sorted([r for r in resistance_levels if r > current_price], reverse=False)[:num_levels]
+        
+        # Get support levels below current price
+        support_below = sorted([s for s in support_levels if s < current_price], reverse=True)[:num_levels]
+        
+        # Also get nearest resistance below and support above for completeness
+        resistance_below = sorted([r for r in resistance_levels if r < current_price], reverse=True)[:1]
+        support_above = sorted([s for s in support_levels if s > current_price], reverse=False)[:1]
+        
+        return {
+            'support_below': support_below,
+            'support_above': support_above,
+            'resistance_below': resistance_below,
+            'resistance_above': resistance_above,
+            'current_price': current_price
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating support/resistance: {e}")
+        return {
+            'support_below': [],
+            'support_above': [],
+            'resistance_below': [],
+            'resistance_above': [],
+            'current_price': df['close'].iloc[-1] if not df.empty else 0
+        }
+
+def calculate_hull_moving_average(df, period=6):
+    """Calculate Hull Moving Average for better trend detection."""
+    try:
+        # Calculate weighted moving averages
+        wma_half = df['close'].rolling(window=period//2).apply(
+            lambda x: np.sum(np.arange(1, len(x)+1) * x) / np.sum(np.arange(1, len(x)+1)), raw=True
+        )
+        wma_full = df['close'].rolling(window=period).apply(
+            lambda x: np.sum(np.arange(1, len(x)+1) * x) / np.sum(np.arange(1, len(x)+1)), raw=True
+        )
+        
+        # Calculate HMA
+        hma = (2 * wma_half - wma_full).rolling(window=int(np.sqrt(period))).mean()
+        return hma
+    except Exception as e:
+        logger.error(f"Error calculating HMA: {e}")
+        return pd.Series(index=df.index)
+
+def calculate_supertrend(df, period=5, multiplier=2.5):
+    """Calculate Supertrend indicator for trend direction."""
+    try:
+        hl2 = (df['high'] + df['low']) / 2
+        atr = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=period)
+        
+        upper_band = hl2 + (multiplier * atr)
+        lower_band = hl2 - (multiplier * atr)
+        
+        supertrend = pd.Series(index=df.index)
+        direction = pd.Series(1, index=df.index)  # Default to long direction
+        
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > upper_band.iloc[i-1]:
+                direction.iloc[i] = 1
+            elif df['close'].iloc[i] < lower_band.iloc[i-1]:
+                direction.iloc[i] = -1
+            else:
+                direction.iloc[i] = direction.iloc[i-1]
+            
+            if direction.iloc[i] == 1:
+                supertrend.iloc[i] = lower_band.iloc[i]
+            else:
+                supertrend.iloc[i] = upper_band.iloc[i]
+        
+        return supertrend, direction
+    except Exception as e:
+        logger.error(f"Error calculating Supertrend: {e}")
+        return pd.Series(index=df.index), pd.Series(1, index=df.index)
+
+def calculate_t3_moving_average(df, period=5, volume_factor=0.7):
+    """Calculate T3 Moving Average for smoother trend detection."""
+    try:
+        # First EMA
+        ema1 = df['close'].ewm(span=period).mean()
+        # Second EMA
+        ema2 = ema1.ewm(span=period).mean()
+        # Third EMA
+        ema3 = ema2.ewm(span=period).mean()
+        # Fourth EMA
+        ema4 = ema3.ewm(span=period).mean()
+        # Fifth EMA
+        ema5 = ema4.ewm(span=period).mean()
+        # Sixth EMA
+        ema6 = ema5.ewm(span=period).mean()
+        
+        # T3 calculation
+        c1 = -volume_factor * volume_factor * volume_factor
+        c2 = 3 * volume_factor * volume_factor + 3 * volume_factor * volume_factor * volume_factor
+        c3 = -6 * volume_factor * volume_factor - 3 * volume_factor - 3 * volume_factor * volume_factor * volume_factor
+        c4 = 1 + 3 * volume_factor + volume_factor * volume_factor * volume_factor + 3 * volume_factor * volume_factor
+        
+        t3 = c1 * ema6 + c2 * ema5 + c3 * ema4 + c4 * ema3
+        return t3
+    except Exception as e:
+        logger.error(f"Error calculating T3: {e}")
+        return pd.Series(index=df.index)
+
+def calculate_zlema(df, period=10):
+    """Calculate Zero Lag EMA for faster response."""
+    try:
+        lag = (period - 1) // 2
+        ema_data = 2 * df['close'] - df['close'].shift(lag)
+        zlema = ema_data.ewm(span=period).mean()
+        return zlema
+    except Exception as e:
+        logger.error(f"Error calculating ZLEMA: {e}")
+        return pd.Series(index=df.index)
+
+def calculate_tema(df, period=5):
+    """Calculate Triple EMA for faster trend detection."""
+    try:
+        ema1 = df['close'].ewm(span=period).mean()
+        ema2 = ema1.ewm(span=period).mean()
+        ema3 = ema2.ewm(span=period).mean()
+        tema = 3 * (ema1 - ema2) + ema3
+        return tema
+    except Exception as e:
+        logger.error(f"Error calculating TEMA: {e}")
+        return pd.Series(index=df.index)
+
+def calculate_jurik_smooth(df, period=5, smoothing=3):
+    """Calculate Jurik Smooth for noise reduction."""
+    try:
+        # Simplified Jurik-like smoothing
+        jma = df['close'].rolling(window=period).mean()
+        for _ in range(smoothing):
+            jma = jma.rolling(window=3).mean()
+        return jma
+    except Exception as e:
+        logger.error(f"Error calculating Jurik Smooth: {e}")
+        return pd.Series(index=df.index)
+
+def calculate_indicators(df):
+    """Calculates all technical indicators for scalping."""
+    if df.empty or len(df) < 50:
+        logger.warning("Not enough data to calculate all indicators")
+        return df
+
+    # Trend Indicators
+    df['ema_fast'] = ta.trend.ema_indicator(df['close'], window=EMA_FAST_PERIOD)
+    df['ema_slow'] = ta.trend.ema_indicator(df['close'], window=EMA_SLOW_PERIOD)
+    df['ema_trend'] = ta.trend.ema_indicator(df['close'], window=EMA_TREND_PERIOD)
+    
+    # Advanced Trend Indicators
+    df['hma'] = calculate_hull_moving_average(df, HULL_MA_PERIOD)
+    df['t3'] = calculate_t3_moving_average(df, T3_PERIOD, T3_VOLUME_FACTOR)
+    df['zlema'] = calculate_zlema(df, ZLEMA_PERIOD)
+    df['tema'] = calculate_tema(df, TEMA_PERIOD)
+    df['jurik_smooth'] = calculate_jurik_smooth(df, JS_PERIOD, JS_SMOOTHING)
+    
+    # Supertrend
+    df['supertrend'], df['supertrend_direction'] = calculate_supertrend(df, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
+    
+    # MACD with faster settings
+    macd = ta.trend.MACD(df['close'], window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+    df['macd_diff'] = macd.macd_diff()
+    
+    # Momentum Indicators
+    df['rsi'] = ta.momentum.rsi(df['close'], window=RSI_PERIOD)
+    df['cci'] = ta.trend.cci(df['high'], df['low'], df['close'], window=CCI_PERIOD)
+    df['williams'] = ta.momentum.williams_r(df['high'], df['low'], df['close'], lbp=WILLIAMS_PERIOD)
+    
+    # Volatility Indicators
+    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=ATR_PERIOD)
+    
+    # Bollinger Bands
+    bollinger = ta.volatility.BollingerBands(df['close'], window=BOLLINGER_PERIOD, window_dev=BOLLINGER_STD)
+    df['bb_upper'] = bollinger.bollinger_hband()
+    df['bb_middle'] = bollinger.bollinger_mavg()
+    df['bb_lower'] = bollinger.bollinger_lband()
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+    
+    # Keltner Channel
+    keltner = ta.volatility.KeltnerChannel(df['high'], df['low'], df['close'], 
+                                         window=KELTNER_PERIOD, 
+                                         window_atr=KELTNER_PERIOD, 
+                                         multiplier=KELTNER_MULTIPLIER)
+    df['keltner_upper'] = keltner.keltner_channel_hband()
+    df['keltner_lower'] = keltner.keltner_channel_lband()
+    
+    # Volume Indicators
+    df['vwap'] = ta.volume.volume_weighted_average_price(df['high'], df['low'], df['close'], df['volume'], window=VWAP_PERIOD)
+    df['vwma'] = (df['close'] * df['volume']).rolling(VWMA_PERIOD).sum() / df['volume'].rolling(VWMA_PERIOD).sum()
+    df['obv'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+    df['obv_ema'] = ta.trend.ema_indicator(df['obv'], window=OBV_SMOOTHING)
+    
+    # Elder's Force Index
+    df['efi'] = (df['close'].diff(EFI_PERIOD) * df['volume']) / 1000000
+    
+    # Ichimoku Cloud (simplified)
+    df['ichi_conversion'] = (df['high'].rolling(ICHIMOKU_CONVERSION).max() + 
+                            df['low'].rolling(ICHIMOKU_CONVERSION).min()) / 2
+    df['ichi_base'] = (df['high'].rolling(ICHIMOKU_BASE).max() + 
+                      df['low'].rolling(ICHIMOKU_BASE).min()) / 2
+    df['ichi_leading_span_a'] = (df['ichi_conversion'] + df['ichi_base']) / 2
+    df['ichi_leading_span_b'] = (df['high'].rolling(ICHIMOKU_SPAN_B).max() + 
+                                df['low'].rolling(ICHIMOKU_SPAN_B).min()) / 2
+    
+    # Trend Strength
+    df['adx'] = ta.trend.adx(df['high'], df['low'], df['close'], window=ADX_PERIOD)
+    
+    # Price position relative to indicators
+    df['price_vs_vwap'] = (df['close'] - df['vwap']) / df['vwap'] * 100
+    df['price_vs_keltner'] = (df['close'] - df['keltner_lower']) / (df['keltner_upper'] - df['keltner_lower']) * 100
+    
+    return df
+
+def analyze_pair(symbol, df, timeframe='5m'):
+    """Analyzes a single pair and returns the signal strength and details."""
+    if df.empty or len(df) < 50:
+        return None
+
+    df = calculate_indicators(df)
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    current_price = df['close'].iloc[-1]
+    
+    # Calculate support/resistance and pivot points
+    sr_levels = calculate_support_resistance(df, num_levels=5)
+    daily_pivots = calculate_pivot_points(df, 'daily')
+    
+    # Price position relative to key levels
+    near_support = any(abs(current_price - level) / current_price < 0.003 for level in sr_levels['support_below'])
+    near_resistance = any(abs(current_price - level) / current_price < 0.003 for level in sr_levels['resistance_above'])
+    
+    # Check if price is near pivot levels
+    near_pivot = False
+    if daily_pivots:
+        pivot_levels = [daily_pivots['pivot_point'], daily_pivots['support_1'], daily_pivots['support_2'],
+                       daily_pivots['resistance_1'], daily_pivots['resistance_2']]
+        near_pivot = any(abs(current_price - level) / current_price < 0.005 for level in pivot_levels)
+
+    # Long Signal Conditions
+    long_conditions = [
+        # Trend conditions (multiple confirmations)
+        latest['ema_fast'] > latest['ema_slow'],
+        latest['ema_slow'] > latest['ema_trend'],
+        current_price > latest['hma'],
+        current_price > latest['t3'],
+        current_price > latest['zlema'],
+        latest['supertrend_direction'] == 1,
+        current_price > latest['vwap'],
+        current_price > latest['vwma'],
+        
+        # Momentum conditions
+        latest['rsi'] > 55 and latest['rsi'] < RSI_OVERBOUGHT,
+        latest['macd'] > latest['macd_signal'],
+        latest['cci'] > 0 and latest['cci'] < CCI_OVERBOUGHT,
+        latest['williams'] > -30,
+        
+        # Volume confirmation
+        latest['obv'] > latest['obv_ema'],
+        latest['efi'] > 0,
+        
+        # Price action
+        near_support or near_pivot,
+        df['close'].iloc[-1] > df['open'].iloc[-1],  # Green candle
+        current_price > latest['ichi_leading_span_a'] and current_price > latest['ichi_leading_span_b'],
+        
+        # Volatility expansion
+        latest['bb_width'] > df['bb_width'].rolling(20).mean().iloc[-1],
+    ]
+
+    # Short Signal Conditions
+    short_conditions = [
+        # Trend conditions (multiple confirmations)
+        latest['ema_fast'] < latest['ema_slow'],
+        latest['ema_slow'] < latest['ema_trend'],
+        current_price < latest['hma'],
+        current_price < latest['t3'],
+        current_price < latest['zlema'],
+        latest['supertrend_direction'] == -1,
+        current_price < latest['vwap'],
+        current_price < latest['vwma'],
+        
+        # Momentum conditions
+        latest['rsi'] < 45 and latest['rsi'] > RSI_OVERSOLD,
+        latest['macd'] < latest['macd_signal'],
+        latest['cci'] < 0 and latest['cci'] > CCI_OVERSOLD,
+        latest['williams'] < -70,
+        
+        # Volume confirmation
+        latest['obv'] < latest['obv_ema'],
+        latest['efi'] < 0,
+        
+        # Price action
+        near_resistance or near_pivot,
+        df['close'].iloc[-1] < df['open'].iloc[-1],  # Red candle
+        current_price < latest['ichi_leading_span_a'] and current_price < latest['ichi_leading_span_b'],
+        
+        # Volatility expansion
+        latest['bb_width'] > df['bb_width'].rolling(20).mean().iloc[-1],
+    ]
+
+    long_confirmations = sum(long_conditions)
+    short_confirmations = sum(short_conditions)
+    total_conditions = len(long_conditions)
+    
+    long_confidence = (long_confirmations / total_conditions) * 100
+    short_confidence = (short_confirmations / total_conditions) * 100
+
+    # Calculate entry and exit points based on ATR and support/resistance
+    atr = latest['atr']
+    entry_price = current_price
+    
+    if long_confidence >= MIN_CONFIDENCE:
+        # Use support level for stop loss if available, otherwise use ATR
+        if sr_levels['support_below']:
+            stop_loss = max(sr_levels['support_below']) * 0.997
+        else:
+            stop_loss = entry_price - (atr * STOP_LOSS_ATR_MULTIPLIER)
+            
+        # Use resistance level for take profit if available, otherwise use ATR
+        if sr_levels['resistance_above']:
+            take_profit = min(sr_levels['resistance_above']) * 0.997
+        else:
+            take_profit = entry_price + (atr * TAKE_PROFIT_ATR_MULTIPLIER)
+            
+        signal = f"LONG ({long_confidence:.0f}% confidence)"
+        direction = 'LONG'
+        
+    elif short_confidence >= MIN_CONFIDENCE:
+        # Use resistance level for stop loss if available, otherwise use ATR
+        if sr_levels['resistance_above']:
+            stop_loss = min(sr_levels['resistance_above']) * 1.003
+        else:
+            stop_loss = entry_price + (atr * STOP_LOSS_ATR_MULTIPLIER)
+            
+        # Use support level for take profit if available, otherwise use ATR
+        if sr_levels['support_below']:
+            take_profit = max(sr_levels['support_below']) * 1.003
+        else:
+            take_profit = entry_price - (atr * TAKE_PROFIT_ATR_MULTIPLIER)
+            
+        signal = f"SHORT ({short_confidence:.0f}% confidence)"
+        direction = 'SHORT'
+    else:
+        signal = "HOLD"
+        direction = 'HOLD'
+        entry_price = 0
+        stop_loss = 0
+        take_profit = 0
+
+    # Calculate risk-reward ratio
+    risk_reward = 0
+    if entry_price > 0 and stop_loss > 0 and take_profit > 0:
+        if direction == 'LONG':
+            risk = entry_price - stop_loss
+            reward = take_profit - entry_price
+        else:
+            risk = stop_loss - entry_price
+            reward = entry_price - take_profit
+            
+        if risk > 0:
+            risk_reward = reward / risk
+
+    return {
+        'symbol': symbol,
+        'timeframe': timeframe,
+        'signal': signal,
+        'direction': direction,
+        'long_confirmations': long_confirmations,
+        'short_confirmations': short_confirmations,
+        'total_conditions': total_conditions,
+        'long_confidence': long_confidence,
+        'short_confidence': short_confidence,
+        'current_price': current_price,
+        'entry_price': entry_price,
+        'stop_loss': stop_loss,
+        'take_profit': take_profit,
+        'risk_reward': risk_reward,
+        'atr': atr,
+        'sr_levels': sr_levels,
+        'daily_pivots': daily_pivots
+    }
+
+def scan_all_pairs():
+    """Scans all available trading pairs in 5m timeframe and returns the best signals."""
+    try:
+        # Get all available trading pairs
+        exchange_info = client.futures_exchange_info()
+        all_symbols = [symbol['symbol'] for symbol in exchange_info['symbols'] 
+                      if symbol['symbol'].endswith('USDT') and symbol['status'] == 'TRADING']
+        
+        # Filter out low volume pairs and limit the number of pairs to scan
+        all_symbols = all_symbols[:SCAN_LIMIT]
+        
+        logger.info(f"Scanning {len(all_symbols)} trading pairs in 5m timeframe...")
+        
+        results = []
+        
+        # Scan each pair in 5m timeframe only
+        for i, symbol in enumerate(all_symbols):
+            try:
+                if i % 10 == 0:
+                    logger.info(f"Analyzing {symbol} in 5m ({i+1}/{len(all_symbols)})")
+                
+                # Get 5m data only for initial screening
+                df = get_latest_historical_data(symbol, '5m')
+                if not df.empty:
+                    # Analyze the pair in 5m timeframe only
+                    result = analyze_pair(symbol, df.copy(), '5m')
+                    if result and result['signal'] != "HOLD" and result['risk_reward'] >= MIN_RISK_REWARD:
+                        # Add the result with 5m-specific confidence
+                        confidence = result['long_confidence'] if 'LONG' in result['signal'] else result['short_confidence']
+                        
+                        results.append({
+                            'symbol': symbol,
+                            'signal': result['signal'],
+                            'confidence': confidence,
+                            'direction': result['direction'],
+                            'entry_price': result['entry_price'],
+                            'stop_loss': result['stop_loss'],
+                            'take_profit': result['take_profit'],
+                            'risk_reward': result['risk_reward'],
+                            'atr': result['atr'],
+                            'current_price': result['current_price']
+                        })
+                        
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol}: {e}")
+                continue
+        
+        # Sort by confidence (highest first)
+        results.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Get top pairs with strongest signals in 5m
+        top_pairs = results[:10] if len(results) >= 10 else results
+        
+        return top_pairs, results
+        
+    except Exception as e:
+        logger.error(f"Error scanning all pairs: {e}")
+        return [], []
+
+def analyze_top_pairs_multitimeframe(top_pairs):
+    """Performs multi-timeframe analysis on the top pairs selected from 5m scan."""
+    if not top_pairs:
+        return []
+    
+    detailed_results = []
+    
+    for pair in top_pairs:
+        symbol = pair['symbol']
+        timeframe_results = {}
+        
+        # Analyze across all timeframes
+        for timeframe in TIME_FRAMES:
+            try:
+                df = get_latest_historical_data(symbol, timeframe)
+                if not df.empty:
+                    result = analyze_pair(symbol, df.copy(), timeframe)
+                    if result:
+                        timeframe_results[timeframe] = result
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol} on {timeframe}: {e}")
+                continue
+        
+        if not timeframe_results:
+            continue
+            
+        # Calculate consensus across timeframes
+        total_long = sum(1 for res in timeframe_results.values() if res['direction'] == 'LONG')
+        total_short = sum(1 for res in timeframe_results.values() if res['direction'] == 'SHORT')
+        total_timeframes = len(timeframe_results)
+        
+        # Calculate average confidence
+        long_confidences = [res['long_confidence'] for res in timeframe_results.values() if res['direction'] == 'LONG']
+        short_confidences = [res['short_confidence'] for res in timeframe_results.values() if res['direction'] == 'SHORT']
+        
+        avg_long_confidence = sum(long_confidences) / max(1, len(long_confidences))
+        avg_short_confidence = sum(short_confidences) / max(1, len(short_confidences))
+        
+        # Determine overall signal based on majority and confidence
+        if total_long > total_short and avg_long_confidence >= MIN_CONFIDENCE:
+            overall_signal = f"LONG ({total_long}/{total_timeframes} timeframes)"
+            signal_strength = avg_long_confidence
+            direction = 'LONG'
+        elif total_short > total_long and avg_short_confidence >= MIN_CONFIDENCE:
+            overall_signal = f"SHORT ({total_short}/{total_timeframes} timeframes)"
+            signal_strength = avg_short_confidence
+            direction = 'SHORT'
+        else:
+            # If equal or below confidence threshold, skip
+            continue
+        
+        # Use the most recent timeframe for entry/exit levels
+        latest_result = timeframe_results['5m'] if '5m' in timeframe_results else list(timeframe_results.values())[-1]
+        
+        detailed_results.append({
+            'symbol': symbol,
+            'overall_signal': overall_signal,
+            'signal_strength': signal_strength,
+            'timeframe_results': timeframe_results,
+            'total_long_timeframes': total_long,
+            'total_short_timeframes': total_short,
+            'total_timeframes': total_timeframes,
+            'entry_price': latest_result['entry_price'],
+            'stop_loss': latest_result['stop_loss'],
+            'take_profit': latest_result['take_profit'],
+            'risk_reward': latest_result['risk_reward'],
+            'atr': latest_result['atr'],
+            'current_price': latest_result['current_price'],
+            'direction': direction
+        })
+    
+    return detailed_results
+
+def display_sure_shot_signals(signals):
+    """Displays sure-shot signals with detailed analysis."""
+    if not signals:
+        return "No sure-shot signals found."
+    
+    output_buffer = io.StringIO()
+    
+    print("\n" + "="*120, file=output_buffer)
+    print("🎯 HIGH-ACCURACY SCALPING SIGNALS", file=output_buffer)
+    print("="*120, file=output_buffer)
+    
+    for i, signal in enumerate(signals, 1):
+        symbol = signal['symbol']
+        direction = signal['direction']
+        
+        print(f"\n{i}. {symbol} - {signal['overall_signal']} (Confidence: {signal['signal_strength']:.1f}%)", file=output_buffer)
+        print(f"   Entry: {signal['entry_price']:.6f} | SL: {signal['stop_loss']:.6f} | TP: {signal['take_profit']:.6f}", file=output_buffer)
+        print(f"   Risk/Reward: {signal['risk_reward']:.2f}:1 | ATR: {signal['atr']:.6f}", file=output_buffer)
+        print(f"   Current Price: {signal['current_price']:.6f}", file=output_buffer)
+        
+        # Show timeframe consensus
+        print(f"   Timeframe Consensus: {signal['total_long_timeframes']} LONG, {signal['total_short_timeframes']} SHORT", file=output_buffer)
+        
+        # Show key levels from 5m timeframe
+        if '5m' in signal['timeframe_results']:
+            tf_result = signal['timeframe_results']['5m']
+            if tf_result['sr_levels']:
+                print(f"   Support Levels: {[f'{x:.6f}' for x in tf_result['sr_levels']['support_below'][:3]]}", file=output_buffer)
+                print(f"   Resistance Levels: {[f'{x:.6f}' for x in tf_result['sr_levels']['resistance_above'][:3]]}", file=output_buffer)
+            
+            if tf_result['daily_pivots']:
+                print(f"   Daily Pivot: {tf_result['daily_pivots']['pivot_point']:.6f}", file=output_buffer)
+    
+    print("\n" + "="*120, file=output_buffer)
+    
+    output_text = output_buffer.getvalue()
+    output_buffer.close()
+    
+    return output_text
+
+def periodic_analysis():
+    """Runs analysis every minute by fetching fresh data."""
+    global best_pairs, sure_shot_signals
+    
+    while True:
+        try:
+            # Calculate next minute boundary
+            now = datetime.utcnow()
+            next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+            sleep_seconds = (next_minute - now).total_seconds()
+            
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"SCANNING MARKET AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"{'='*60}")
+            
+            # Scan all pairs for best signals every 3 minutes for faster scanning
+            if now.minute % 3 == 0:
+                logger.info("Scanning all pairs in 5m timeframe for best signals...")
+                top_pairs_5m, all_results = scan_all_pairs()
+                
+                # Now perform multi-timeframe analysis on the top pairs
+                best_pairs = analyze_top_pairs_multitimeframe(top_pairs_5m)
+                
+                # Filter for sure-shot signals (high confidence, good risk/reward)
+                sure_shot_signals = [pair for pair in best_pairs 
+                                   if pair['signal_strength'] >= MIN_CONFIDENCE 
+                                   and pair['risk_reward'] >= MIN_RISK_REWARD]
+                
+                output_buffer = io.StringIO()
+                print("\n" + "="*100, file=output_buffer)
+                print("QUICK SCALPING SCAN RESULTS", file=output_buffer)
+                print("="*100, file=output_buffer)
+                
+                print(f"\nTotal pairs analyzed in 5m: {len(all_results)}", file=output_buffer)
+                print(f"Potential signals found: {len(best_pairs)}", file=output_buffer)
+                print(f"Sure-shot signals found: {len(sure_shot_signals)}", file=output_buffer)
+                
+                # Display sure-shot signals
+                if sure_shot_signals:
+                    sure_shot_text = display_sure_shot_signals(sure_shot_signals)
+                    print(sure_shot_text, file=output_buffer)
+                else:
+                    print("\nNo sure-shot signals meeting criteria found.", file=output_buffer)
+                    if best_pairs:
+                        print("Top 3 potential signals:", file=output_buffer)
+                        for i, pair in enumerate(best_pairs[:3], 1):
+                            print(f"{i}. {pair['symbol']}: {pair['overall_signal']} ({pair['signal_strength']:.1f}%)", file=output_buffer)
+                
+                print("\n" + "="*100, file=output_buffer)
+                
+                output_text = output_buffer.getvalue()
+                output_buffer.close()
+                
+                if gui_instance:
+                    gui_instance.update_display(output_text)
+                else:
+                    print(output_text)
+            
+            # Analyze the sure-shot pairs in detail every minute
+            if sure_shot_signals:
+                for signal in sure_shot_signals:
+                    symbol = signal['symbol']
+                    df = get_latest_historical_data(symbol, '5m')
+                    if not df.empty:
+                        # Get updated analysis
+                        updated_analysis = analyze_pair(symbol, df.copy(), '5m')
+                        
+                        if updated_analysis and updated_analysis['signal'] != "HOLD":
+                            output_buffer = io.StringIO()
+                            print(f"\n📈 UPDATED ANALYSIS FOR {symbol}:", file=output_buffer)
+                            print(f"Signal: {updated_analysis['signal']}", file=output_buffer)
+                            print(f"Price: {updated_analysis['current_price']:.6f} (Entry: {updated_analysis['entry_price']:.6f})", file=output_buffer)
+                            print(f"Stop Loss: {updated_analysis['stop_loss']:.6f} | Take Profit: {updated_analysis['take_profit']:.6f}", file=output_buffer)
+                            
+                            output_text = output_buffer.getvalue()
+                            output_buffer.close()
+                            
+                            if gui_instance:
+                                gui_instance.update_display(output_text)
+                
+        except Exception as e:
+            logger.error(f"Error in periodic analysis: {e}")
+            time.sleep(60)  # Wait 1 minute before retrying if error occurs
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Create GUI
+    root = tk.Tk()
+    gui_instance = TradingBotGUI(root)
+    
+    # Redirect stdout to our thread-safe print
+    sys.stdout = ThreadSafePrint(gui_instance)
+    
+    # Run initial scan
+    logger.info("Running initial market scan...")
+    top_pairs_5m, all_results = scan_all_pairs()
+    
+    # Now perform multi-timeframe analysis on the top pairs
+    best_pairs = analyze_top_pairs_multitimeframe(top_pairs_5m)
+    
+    # Filter for sure-shot signals (high confidence, good risk/reward)
+    sure_shot_signals = []
+    if best_pairs:
+        sure_shot_signals = [pair for pair in best_pairs 
+                           if pair.get('signal_strength', 0) >= MIN_CONFIDENCE 
+                           and pair.get('risk_reward', 0) >= MIN_RISK_REWARD]
+    
+    # Display initial results
+    output_buffer = io.StringIO()
+    print("\n" + "="*100, file=output_buffer)
+    print("INITIAL QUICK SCALPING SCAN RESULTS", file=output_buffer)
+    print("="*100, file=output_buffer)
+    
+    print(f"\nTotal pairs analyzed: {len(all_results)}", file=output_buffer)
+    print(f"Potential signals found: {len(best_pairs) if best_pairs else 0}", file=output_buffer)
+    print(f"Sure-shot signals found: {len(sure_shot_signals)}", file=output_buffer)
+    
+    if sure_shot_signals:
+        sure_shot_text = display_sure_shot_signals(sure_shot_signals)
+        print(sure_shot_text, file=output_buffer)
+    else:
+        print("\nNo sure-shot signals found in initial scan.", file=output_buffer)
+        if best_pairs:
+            print("Top 5 potential signals:", file=output_buffer)
+            for i, pair in enumerate(best_pairs[:5], 1):
+                print(f"{i}. {pair['symbol']}: {pair['overall_signal']} ({pair.get('signal_strength', 0):.1f}%)", file=output_buffer)
+    
+    print("\n" + "="*100, file=output_buffer)
+    
+    output_text = output_buffer.getvalue()
+    output_buffer.close()
+    
+    if gui_instance:
+        gui_instance.update_display(output_text)
+    
+    # Start the periodic analysis thread (runs every minute)
+    analysis_thread = Thread(target=periodic_analysis, daemon=True)
+    analysis_thread.start()
+    
+    logger.info(f"\nAnalysis will run every minute at :00 seconds")
+    logger.info(f"Full market scan will run every 3 minutes for quick scalping")
+    
+    logger.info(f"Minimum confidence for signals: {MIN_CONFIDENCE}%")
+    logger.info(f"Minimum risk/reward ratio: {MIN_RISK_REWARD}")
+    logger.info("\nPress Ctrl+C to exit.")
+
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        logger.info("Script finished.")
