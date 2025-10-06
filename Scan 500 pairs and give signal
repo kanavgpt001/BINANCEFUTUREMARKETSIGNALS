@@ -30,8 +30,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 pd.set_option('mode.chained_assignment', None)
 
 # --- Configuration ---
-API_KEY = "nAOUyjS7pRj9YVpkU8o3SkshIAe5yjAjVZznLyc04gKxFaRhefGFIye8ONNkINST"
-API_SECRET = "HhgMdAsBylrDMkYMU7scJAK2oGCdsPeWzdvSslEhCk8Xntns2ssFxjP78CO5bh6G"
+API_KEY = ""
+API_SECRET = ""
 
 # Analysis Parameters
 TIME_FRAMES = ['1m', '3m', '5m']
